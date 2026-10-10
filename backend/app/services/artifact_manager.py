@@ -1,0 +1,245 @@
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+
+ARTIFACT_ALLOWLIST = frozenset({
+    "config.yaml",
+    "used_config.yaml",
+    "used_config.json",
+    "trace_meta.json",
+    "summary.csv",
+    "latency.csv",
+    "runtime.log",
+    "report.md",
+    "dual_chain_summary.csv",
+    "dual_chain_summary.json",
+    "stage_metrics.csv",
+    "protocol_summary.csv",
+    "protocol_summary.json",
+    "protocol_results.csv",
+    "protocol_events.csv",
+    "sweep_summary.csv",
+    "sweep_summary.json",
+    "sweep_report.md",
+    "case_artifacts_index.json",
+    "calibration_summary.csv",
+    "calibration_summary.json",
+    "replay_vs_observed.csv",
+    "calibration_report.md",
+    "summary.json",
+    "block_log.csv",
+    "tx_results.csv",
+    "state_commit_log.csv",
+    "txpool_log.csv",
+    "consensus_log.csv",
+    "routing_log.csv",
+    "execution_log.csv",
+    "state_access_log.csv",
+    "node_topology.csv",
+    "node_log.csv",
+    "network_log.csv",
+    "consensus_message_log.csv",
+    "node_address_table.csv",
+    "topology.json",
+    "launch_nodes_windows.bat",
+    "launch_nodes_linux.sh",
+    "launcher_readme.md",
+    "node_process_status.csv",
+    "node_process_manifest.json",
+    "node_process_log_sample.log",
+    "address_table.json",
+    "multi_process_manifest.json",
+    "node_process_log.csv",
+    "node_lifecycle_log.csv",
+    "network_message_log.csv",
+    "node_process_status.json",
+    "local_multi_process_summary.json",
+    "node_stdout.log",
+    "node_stderr.log",
+    "shard_assignment_log.csv",
+    "committee_assignment_log.csv",
+    "committee_summary.json",
+    "epoch_log.csv",
+    "reconfiguration_plan.json",
+    "reshard_plan_log.csv",
+    "reconfiguration_summary.json",
+    "metaverse_workload_catalog.json",
+    "metaverse_workload_config.json",
+    "metaverse_trace_meta.json",
+    "scenario_summary.csv",
+    "hotspot_distribution.csv",
+    "cross_scene_transfer_log.csv",
+    "offchain_confirmation_log.csv",
+    "cross_metaverse_transfer_log.csv",
+    "metaverse_experiment_summary.json",
+    "baseline_matrix.csv",
+    "multi_seed_summary.csv",
+    "benchmark_suite_summary.json",
+    "paper_table_latency.csv",
+    "paper_table_throughput.csv",
+    "paper_table_cross_shard.csv",
+    "paper_table_offchain_confirmation.csv",
+    "paper_figure_data.csv",
+    "paper_export_manifest.json",
+    "fault_injection_config.json",
+    "fault_injection_log.csv",
+    "node_failure_log.csv",
+    "node_recovery_log.csv",
+    "network_fault_log.csv",
+    "target_congestion_log.csv",
+    "relay_fault_observation_log.csv",
+    "fault_injection_summary.json",
+    "observability_summary.json",
+    "observability_timeline.csv",
+    "component_health_summary.csv",
+    "runtime_component_status.json",
+    "final_artifact_catalog.json",
+    "final_artifact_catalog.md",
+    "v3_final_reproducibility_manifest.json",
+    "v3_reproducibility_guide.md",
+    "v3_experiment_manual.md",
+    "v3_paper_experiment_mapping.md",
+    "v3_final_summary.json",
+    "formal_benchmark_config.json",
+    "formal_matrix_preview.json",
+    "formal_run_matrix.csv",
+    "formal_run_index.csv",
+    "formal_run_manifest.json",
+    "formal_progress.json",
+    "formal_failed_runs.csv",
+    "formal_child_artifact_index.csv",
+    "formal_chart_preview.json",
+    "formal_metric_extraction_report.csv",
+    "formal_metric_extraction_report.json",
+    "formal_missing_metrics.csv",
+    "formal_raw_summary.csv",
+    "formal_aggregate_summary.csv",
+    "formal_workload_comparison.csv",
+    "formal_latency_summary.csv",
+    "formal_throughput_summary.csv",
+    "formal_overhead_summary.csv",
+    "formal_confidence_interval.csv",
+    "formal_paper_figure_data.csv",
+    "formal_reproducibility_manifest.json",
+    "formal_benchmark_report.md",
+    "tcp_adapter_status.csv",
+    "network_send_log.csv",
+    "network_receive_log.csv",
+    "typed_message_log.csv",
+    "consensus_network_light_log.csv",
+    "network_consensus_summary.json",
+    "pbft_state_log.csv",
+    "pbft_message_log.csv",
+    "quorum_log.csv",
+    "finalized_block_log.csv",
+    "consensus_network_log.csv",
+    "pbft_network_summary.json",
+    "cross_shard_tx_log.csv",
+    "cross_shard_message_log.csv",
+    "relay_preview_log.csv",
+    "cross_shard_status.csv",
+    "cross_shard_summary.json",
+    "relay_state_machine_log.csv",
+    "source_lock_log.csv",
+    "relay_certificate_log.csv",
+    "relay_proof_verification_log.csv",
+    "target_verification_log.csv",
+    "target_commit_log.csv",
+    "source_finalize_log.csv",
+    "cross_shard_timeout_refund_log.csv",
+    "cross_shard_failure_log.csv",
+    "relay_mvp_summary.json",
+    "state_storage_log.csv",
+    "state_version_log.csv",
+    "state_root_log.csv",
+    "state_proof_log.csv",
+    "state_proof_verification_log.csv",
+    "witness_log.csv",
+    "witness_verification_log.csv",
+    "state_authenticity_summary.json",
+    "benchmark_template_catalog.json",
+    "baseline_profile_catalog.json",
+    "benchmark_plan.json",
+    "benchmark_run_index.csv",
+    "sweep_matrix.csv",
+    "baseline_comparison.csv",
+    "reproducibility_manifest.json",
+    "benchmark_report.md",
+    "benchmark_summary.json",
+    "used_chain_profile.yaml",
+    "used_chain_profile.json",
+    "used_plugin_profile.yaml",
+    "used_plugin_profile.json",
+    "used_experiment_profile.yaml",
+    "used_experiment_profile.json",
+    "composer_draft.json",
+    "normalized_draft.json",
+    "draft_validation.json",
+    "generated_experiment_profile.json",
+    "generated_experiment_profile.yaml",
+    "generated_plugin_profile.json",
+    "generated_plugin_profile.yaml",
+    "metatrack_summary.csv",
+    "metatrack_summary.json",
+    "metatrack_latency.csv",
+    "metatrack_mechanism_metrics.csv",
+    "metatrack_ablation_report.md",
+    "run_index.csv",
+    "aggregate_summary.csv",
+    "ablation_report.md",
+    "realism_readiness.json",
+    "realism_readiness.md",
+})
+
+
+class ArtifactError(ValueError):
+    """Raised when an artifact request is malformed."""
+
+
+class ArtifactForbidden(PermissionError):
+    """Raised when an artifact is not downloadable."""
+
+
+class ArtifactMissing(FileNotFoundError):
+    """Raised when a valid artifact does not exist."""
+
+
+def validate_filename(filename: str) -> None:
+    if "/" in filename or "\\" in filename or filename in {".", ".."}:
+        raise ArtifactError("invalid artifact filename")
+    if filename not in ARTIFACT_ALLOWLIST:
+        raise ArtifactForbidden("artifact is not downloadable")
+
+
+def list_artifacts(run_dir: Path, run_id: str) -> list[dict[str, object]]:
+    artifacts = []
+    for filename in sorted(ARTIFACT_ALLOWLIST):
+        path = run_dir / filename
+        if path.is_file():
+            artifacts.append({
+                "name": filename,
+                "download_url": f"/api/v2/runs/{run_id}/artifacts/{filename}",
+                "size_bytes": path.stat().st_size,
+            })
+    return artifacts
+
+
+def get_artifact_path(run_dir: Path, filename: str) -> Path:
+    validate_filename(filename)
+    root = run_dir.resolve()
+    path = (run_dir / filename).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ArtifactError("artifact path must stay inside the run directory") from exc
+    if not path.is_file():
+        raise ArtifactMissing("artifact not found")
+    return path
+
+
+def mirror_run_to_latest(run_dir: Path, latest_dir: Path) -> None:
+    if latest_dir.exists():
+        shutil.rmtree(latest_dir)
+    latest_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(run_dir, latest_dir)

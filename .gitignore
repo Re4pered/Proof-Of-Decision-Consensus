@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+.cache/
+chain/fabric/chaincode/*/vendor/
+
+# Node.js
+node_modules/
+dist/
+
+# Go
+*.exe
+*.test
+
+# Generated experiment outputs
+data/
+results/
+artifacts/
+experiments/runs/
+*.log
+*.csv
+*.jsonl
+*.jsonl.gz
+!tests/golden/*.jsonl.gz
+
+# V5 workload data plane definitions are tracked; local source and generated
+# workload caches remain local-only.
+!/data/
+!/data/workloads/
+!/data/workloads/manifests/
+!/data/workloads/manifests/**
+!/data/workloads/schemas/
+!/data/workloads/schemas/**
+!/data/workloads/samples/
+!/data/workloads/samples/**
+/dcl_sales_workload_chain_ready.csv
+/data_local/workloads/
+/.cache/workloads/
+
+# Local tooling
+.env
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# TypeScript build cache
+frontend/tsconfig.tsbuildinfo
+frontend/test-results/
+frontend/playwright-report/
+
+# Root-level local V5 audit and release-validation evidence. These artifacts
+# are generated outside the formal artifact roots and must never be staged.
+/failed_baseline_detail.json
+/metatrack_*.txt
+/registry_test_context.txt
+/run_retry_pacing_green_validation.ps1
+/runtime_commit_receipt_context.txt
+/v5_*.json
+/v5_*.txt
+/v5_*.md
+/v5_*.patch
+/v5_*.zip
+/v5_*/
+/v5grp_*.zip
+/v5grp_*/
+
+# Broken virtual environments preserved by smart launcher
+.venv.broken-*/
+
+/dataset/
+.mbe_fix_backups/
+.mbe_evidence_runs/
