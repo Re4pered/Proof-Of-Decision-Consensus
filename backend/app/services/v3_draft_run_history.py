@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from backend.app.services.v3_composer_draft_runner import V3_DRAFT_RUNS_ROOT, list_draft_artifacts
+
+
+REQUIRED_HISTORY_FILES = (
+    "composer_draft.json",
+    "normalized_draft.json",
+    "draft_validation.json",
+    "generated_experiment_profile.json",
+    "generated_plugin_profile.json",
+)
+
+
+class DraftRunHistoryError(ValueError):
+    """Raised when a draft run history request is malformed."""
+
+
+class DraftRunNotFound(FileNotFoundError):
+    """Raised when a draft run directory does not exist."""
+
+
+def list_v3_draft_runs(limit: int = 20, root: Path | None = None) -> dict[str, list[dict[str, Any]]]:
+    base = root or V3_DRAFT_RUNS_ROOT
+    if not base.exists():
+        return {"runs": []}
+    runs = [summarize_draft_run(path, base) for path in _run_dirs(base)]
+    runs.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    return {"runs": runs[: max(1, min(limit, 100))]}
+
+
+def get_v3_draft_run_detail(run_id: str, root: Path | None = None) -> dict[str, Any]:
+    base = root or V3_DRAFT_RUNS_ROOT
+    run_dir = _safe_run_dir(run_id, base)
+    if not run_dir.is_dir():
+        raise DraftRunNotFound(f"draft run not found: {run_id}")
+
+    composer_draft = _read_json(run_dir / "composer_draft.json")
+    normalized_draft = _read_json(run_dir / "normalized_draft.json")
+    validation = _read_json(run_dir / "draft_validation.json")
+    generated_experiment_profile = _read_json_or_yaml(run_dir, "generated_experiment_profile")
+    generated_plugin_profile = _read_json_or_yaml(run_dir, "generated_plugin_profile")
+    artifacts = list_draft_artifacts(run_dir, run_id)
+
+    return {
+        "run_id": run_id,
+        "created_at": _mtime(run_dir),
+        "composer_draft": composer_draft,
+        "normalized_draft": normalized_draft,
+        "validation": validation,
+        "generated_experiment_profile": generated_experiment_profile,
+        "generated_plugin_profile": generated_plugin_profile,
+        "artifact_groups": artifact_groups(artifacts),
+        "artifacts": artifacts,
+        "summary_preview": _summary_preview(run_dir),
+        "missing_files": _missing_files(run_dir),
+    }
+
+
+def summarize_draft_run(run_dir: Path, root: Path | None = None) -> dict[str, Any]:
+    base = root or V3_DRAFT_RUNS_ROOT
+    run_id = run_dir.name
+    _safe_run_dir(run_id, base)
+    normalized = _read_json(run_dir / "normalized_draft.json")
+    validation = _read_json(run_dir / "draft_validation.json")
+    composer = _read_json(run_dir / "composer_draft.json")
+    artifacts = list_draft_artifacts(run_dir, run_id)
+    selected_plugins = _selected_plugins(normalized, composer)
+
+    return {
+        "run_id": run_id,
+        "created_at": _mtime(run_dir),
+        "template_id": normalized.get("template_id") or composer.get("template_id", ""),
+        "experiment_template": normalized.get("experiment_template") or normalized.get("template_id") or composer.get("template_id", ""),
+        "preset_id": normalized.get("preset_id") or composer.get("preset_id", "") or "legacy/default smoke",
+        "preset_name": normalized.get("preset_name", ""),
+        "variable_module": normalized.get("variable_module", ""),
+        "locked_modules": normalized.get("locked_modules", {}),
+        "fairness_validated": bool(normalized.get("fairness_validated", False)),
+        "run_mode": normalized.get("run_mode") or validation.get("run_mode", "draft_smoke"),
+        "is_valid": bool(validation.get("is_valid", False)),
+        "is_runnable": bool(validation.get("is_runnable", False)),
+        "selected_plugins": selected_plugins,
+        "variable_modules": normalized.get("variable_modules", validation.get("variable_modules", [])),
+        "fixed_modules": normalized.get("fixed_modules", validation.get("fixed_modules", [])),
+        "disabled_modules": normalized.get("disabled_modules", validation.get("disabled_modules", [])),
+        "output_modules": normalized.get("output_modules", validation.get("output_modules", [])),
+        "artifact_count": len(artifacts),
+        "artifact_groups": artifact_groups(artifacts),
+        "summary_preview": _summary_preview(run_dir),
+        "missing_files": _missing_files(run_dir),
+    }
+
+
+def artifact_groups(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups = [
+        ("Draft config", {"composer_draft.json", "normalized_draft.json", "draft_validation.json", "generated_experiment_profile.json", "generated_experiment_profile.yaml", "generated_plugin_profile.json", "generated_plugin_profile.yaml"}),
+        ("Run summary", {"summary.csv", "summary.json", "report.md", "latency.csv"}),
+        ("Runtime queue logs", {"txpool_log.csv"}),
+        ("Runtime consensus logs", {"consensus_log.csv"}),
+        ("Runtime routing logs", {"routing_log.csv"}),
+        ("Runtime execution logs", {"execution_log.csv"}),
+        ("Runtime state access logs", {"state_access_log.csv"}),
+        ("Runtime commit logs", {"state_commit_log.csv"}),
+        ("Node-level runtime artifacts", {"node_topology.csv", "node_log.csv", "network_log.csv", "consensus_message_log.csv"}),
+        ("Local launcher artifacts", {"node_address_table.csv", "topology.json", "launch_nodes_windows.bat", "launch_nodes_linux.sh", "launcher_readme.md"}),
+        ("Local node process preview artifacts", {"node_process_status.csv", "node_process_manifest.json", "node_process_log_sample.log"}),
+        ("Local multi-process runtime artifacts", {"address_table.json", "multi_process_manifest.json", "node_process_log.csv", "node_lifecycle_log.csv", "network_message_log.csv", "node_process_status.json", "local_multi_process_summary.json", "node_stdout.log", "node_stderr.log"}),
+        ("Committee / Epoch artifacts", {"shard_assignment_log.csv", "committee_assignment_log.csv", "committee_summary.json", "epoch_log.csv", "reconfiguration_plan.json", "reshard_plan_log.csv", "reconfiguration_summary.json"}),
+        ("Metaverse workload artifacts", {"metaverse_workload_catalog.json", "metaverse_workload_config.json", "metaverse_trace_meta.json", "scenario_summary.csv", "hotspot_distribution.csv", "cross_scene_transfer_log.csv", "offchain_confirmation_log.csv", "cross_metaverse_transfer_log.csv", "metaverse_experiment_summary.json"}),
+        ("Benchmark matrix artifacts", {"baseline_matrix.csv", "multi_seed_summary.csv", "benchmark_suite_summary.json"}),
+        ("Paper export artifacts", {"paper_table_latency.csv", "paper_table_throughput.csv", "paper_table_cross_shard.csv", "paper_table_offchain_confirmation.csv", "paper_figure_data.csv", "paper_export_manifest.json"}),
+        ("Fault Injection artifacts", {"fault_injection_config.json", "fault_injection_log.csv", "node_failure_log.csv", "node_recovery_log.csv", "network_fault_log.csv", "target_congestion_log.csv", "relay_fault_observation_log.csv", "fault_injection_summary.json"}),
+        ("Observability artifacts", {"observability_summary.json", "observability_timeline.csv", "component_health_summary.csv", "runtime_component_status.json"}),
+        ("Reproducibility / Final Closure artifacts", {"final_artifact_catalog.json", "final_artifact_catalog.md", "v3_final_reproducibility_manifest.json", "v3_reproducibility_guide.md", "v3_experiment_manual.md", "v3_paper_experiment_mapping.md", "v3_final_summary.json"}),
+        ("NetworkAdapter typed message artifacts", {"tcp_adapter_status.csv", "network_send_log.csv", "network_receive_log.csv", "typed_message_log.csv"}),
+        ("Consensus-light over NetworkAdapter artifacts", {"consensus_network_light_log.csv", "network_consensus_summary.json"}),
+        ("PBFT state machine preview artifacts", {"pbft_state_log.csv", "pbft_message_log.csv", "quorum_log.csv", "finalized_block_log.csv"}),
+        ("PBFT over NetworkAdapter artifacts", {"consensus_network_log.csv", "pbft_network_summary.json"}),
+        ("Cross-shard skeleton artifacts", {"cross_shard_tx_log.csv", "cross_shard_message_log.csv", "relay_preview_log.csv", "cross_shard_status.csv", "cross_shard_summary.json"}),
+        ("Relay MVP artifacts", {"relay_state_machine_log.csv", "source_lock_log.csv", "relay_certificate_log.csv", "relay_proof_verification_log.csv", "target_verification_log.csv", "target_commit_log.csv", "source_finalize_log.csv", "cross_shard_timeout_refund_log.csv", "cross_shard_failure_log.csv", "relay_mvp_summary.json"}),
+        ("State authenticity artifacts", {"state_storage_log.csv", "state_version_log.csv", "state_root_log.csv", "state_proof_log.csv", "state_proof_verification_log.csv", "witness_log.csv", "witness_verification_log.csv", "state_authenticity_summary.json"}),
+        ("Benchmark artifacts", {"benchmark_template_catalog.json", "baseline_profile_catalog.json", "benchmark_plan.json", "benchmark_run_index.csv", "sweep_matrix.csv", "sweep_summary.csv", "sweep_summary.json", "aggregate_summary.csv", "baseline_comparison.csv", "reproducibility_manifest.json", "benchmark_report.md", "benchmark_summary.json"}),
+        ("Chain runtime logs", {"runtime.log", "block_log.csv", "tx_results.csv"}),
+        ("MetaTrack metrics", {"metatrack_summary.csv", "metatrack_summary.json", "metatrack_latency.csv", "metatrack_mechanism_metrics.csv", "metatrack_ablation_report.md"}),
+        ("Controlled smoke", {"run_index.csv", "aggregate_summary.csv", "ablation_report.md", "realism_readiness.json", "realism_readiness.md"}),
+        ("Used profiles", {"used_chain_profile.yaml", "used_plugin_profile.yaml", "used_experiment_profile.yaml", "used_chain_profile.json", "used_plugin_profile.json", "used_experiment_profile.json"}),
+    ]
+    by_name = {artifact["name"]: artifact for artifact in artifacts}
+    result = []
+    for title, filenames in groups:
+        files = [by_name[name] for name in sorted(filenames) if name in by_name]
+        if files:
+            result.append({"title": title, "files": files})
+    return result
+
+
+def _run_dirs(root: Path) -> list[Path]:
+    return [
+        path
+        for path in root.iterdir()
+        if path.is_dir() and path.name != "latest" and _valid_run_id(path.name)
+    ]
+
+
+def _safe_run_dir(run_id: str, root: Path) -> Path:
+    if not _valid_run_id(run_id):
+        raise DraftRunHistoryError("invalid draft run id")
+    base = root.resolve()
+    path = (root / run_id).resolve()
+    try:
+        path.relative_to(base)
+    except ValueError as exc:
+        raise DraftRunHistoryError("draft run path must stay inside .cache/v3_draft_runs") from exc
+    return path
+
+
+def _valid_run_id(run_id: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,120}", run_id)) and run_id not in {".", "..", "latest"}
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _read_json_or_yaml(run_dir: Path, stem: str) -> dict[str, Any]:
+    json_value = _read_json(run_dir / f"{stem}.json")
+    if json_value:
+        return json_value
+    yaml_path = run_dir / f"{stem}.yaml"
+    if not yaml_path.is_file():
+        return {}
+    try:
+        value = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _summary_preview(run_dir: Path) -> dict[str, Any]:
+    json_value = _read_json(run_dir / "summary.json")
+    if json_value:
+        return _pick_summary_fields(json_value)
+    csv_path = run_dir / "summary.csv"
+    if not csv_path.is_file():
+        return {}
+    try:
+        with csv_path.open(encoding="utf-8", newline="") as stream:
+            row = next(csv.DictReader(stream), {})
+    except OSError:
+        return {}
+    return _pick_summary_fields(row)
+
+
+def _pick_summary_fields(summary: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "tx_count",
+        "success_count",
+        "failure_count",
+        "failed_count",
+        "avg_latency_ms",
+        "p95_latency_ms",
+        "p99_latency_ms",
+        "queue_wait_ms",
+        "txpool_admitted_count",
+        "txpool_rejected_count",
+        "txpool_peak_size",
+        "txpool_avg_wait_ms",
+        "txpool_p95_wait_ms",
+        "empty_block_count",
+        "avg_block_size",
+        "max_block_size",
+        "block_interval_ms",
+        "avg_block_interval_ms",
+        "blockproducer_count_cut_count",
+        "blockproducer_time_cut_count",
+        "blockproducer_drain_cut_count",
+        "blockproducer_empty_cut_count",
+        "consensus_latency_ms",
+        "avg_consensus_latency_ms",
+        "p95_consensus_latency_ms",
+        "consensus_message_count",
+        "avg_consensus_message_count",
+        "consensus_round_count",
+        "view_change_count",
+        "finalized_block_count",
+        "failed_block_count",
+        "routing_plugin",
+        "routing_decision_count",
+        "cross_shard_tx_count",
+        "local_tx_count",
+        "remote_state_access_count",
+        "avg_touched_shards",
+        "max_touched_shards",
+        "hotspot_key_count",
+        "coaccess_group_count",
+        "avg_routing_overhead_ms",
+        "execution_plugin",
+        "execution_tx_count",
+        "fast_track_count",
+        "conservative_track_count",
+        "blocked_tx_count",
+        "dependency_edge_count",
+        "avg_dependency_edges_per_tx",
+        "avg_execution_latency_ms",
+        "p95_execution_latency_ms",
+        "max_execution_latency_ms",
+        "logical_worker_count",
+        "parallelizable_tx_count",
+        "serial_tx_count",
+        "state_access_plugin",
+        "state_access_count",
+        "local_state_access_count",
+        "remote_state_access_ratio",
+        "cache_hit_count",
+        "cache_miss_count",
+        "cache_hit_rate",
+        "prefetch_hit_count",
+        "prefetch_miss_count",
+        "prefetch_hit_rate",
+        "avg_state_access_latency_ms",
+        "p95_state_access_latency_ms",
+        "max_state_access_latency_ms",
+        "remote_state_access_latency_ms",
+        "witness_estimated_count",
+        "proof_estimated_count",
+        "estimated_witness_bytes",
+        "estimated_proof_bytes",
+        "commit_plugin",
+        "commit_tx_count",
+        "commit_update_count",
+        "normal_commit_count",
+        "conservative_commit_count",
+        "hotspot_update_count",
+        "aggregated_update_count",
+        "raw_update_count",
+        "aggregation_group_count",
+        "aggregation_ratio",
+        "constraint_check_count",
+        "constraint_passed_count",
+        "constraint_failed_count",
+        "avg_commit_latency_ms",
+        "p95_commit_latency_ms",
+        "max_commit_latency_ms",
+        "shard_count",
+        "validators_per_shard",
+        "logical_node_count",
+        "validator_node_count",
+        "executor_node_count",
+        "storage_node_count",
+        "supervisor_node_count",
+        "message_count",
+        "network_message_count",
+        "consensus_message_count",
+        "node_event_count",
+        "launcher_mode",
+        "launcher_script_count",
+        "launchable_node_count",
+        "node_address_count",
+        "windows_launcher_available",
+        "linux_launcher_available",
+        "launcher_preview_only",
+        "node_process_entrypoint_available",
+        "node_process_preview_available",
+        "node_process_status_available",
+        "node_process_manifest_available",
+        "node_process_preview_only",
+        "network_adapter_selected",
+        "tcp_preview_enabled",
+        "tcp_listen_node_count",
+        "tcp_send_count",
+        "tcp_receive_count",
+        "typed_message_count",
+        "network_error_count",
+        "consensus_over_network_enabled",
+        "consensus_runtime_selected",
+        "proposal_preview_count",
+        "vote_preview_count",
+        "light_quorum_reached_count",
+        "consensus_network_error_count",
+        "consensus_network_path",
+        "pbft_view",
+        "pbft_sequence",
+        "pbft_preprepare_count",
+        "pbft_prepare_count",
+        "pbft_commit_count",
+        "pbft_quorum_reached_count",
+        "pbft_finalized_block_count",
+        "pbft_consensus_latency_ms",
+        "pbft_preview_enabled",
+        "pbft_quorum_threshold",
+        "pbft_over_network_enabled",
+        "pbft_network_path",
+        "pbft_network_message_count",
+        "pbft_network_error_count",
+        "pbft_preprepare_network_count",
+        "pbft_prepare_network_count",
+        "pbft_commit_network_count",
+        "pbft_finalized_network_count",
+        "pbft_network_quorum_reached_count",
+        "cross_shard_protocol_selected",
+        "cross_shard_message_count",
+        "relay_preview_count",
+        "cross_shard_completed_count",
+        "cross_shard_failed_count",
+        "cross_shard_avg_latency_ms",
+        "relay_mvp_enabled",
+        "relay_mvp_tx_count",
+        "relay_source_lock_count",
+        "relay_certificate_count",
+        "relay_proof_verified_count",
+        "relay_proof_failed_count",
+        "relay_target_verified_count",
+        "relay_target_commit_count",
+        "relay_source_finalized_count",
+        "relay_timeout_count",
+        "relay_refund_count",
+        "relay_abort_count",
+        "relay_success_count",
+        "relay_failed_count",
+        "relay_avg_latency_ms",
+        "relay_mvp_truth",
+        "state_backend_selected",
+        "persistent_state_enabled",
+        "state_root_enabled",
+        "state_root_count",
+        "state_key_count",
+        "state_update_count",
+        "state_proof_generated_count",
+        "state_proof_verified_count",
+        "state_proof_failed_count",
+        "witness_generated_count",
+        "witness_verified_count",
+        "witness_failed_count",
+        "state_authenticity_error_count",
+        "benchmark_template_selected",
+        "baseline_profile_selected",
+        "benchmark_run_count",
+        "sweep_parameter_count",
+        "repeat_count",
+        "benchmark_artifact_count",
+        "baseline_comparison_count",
+        "reproducibility_manifest_available",
+        "benchmark_report_available",
+        "paper_grade_benchmark",
+        "node_runtime_mode",
+        "process_runtime_mode",
+        "local_multi_process_enabled",
+        "planned_process_count",
+        "started_process_count",
+        "stopped_process_count",
+        "failed_process_count",
+        "capped_process_count",
+        "max_local_processes",
+        "network_path_truth",
+        "committee_count",
+        "epoch_count",
+        "reconfiguration_event_count",
+        "committee_epoch_enabled",
+        "committee_epoch_truth",
+        "runtime_realism_truth",
+        "metaverse_suite_enabled",
+        "metaverse_scenario_selected",
+        "metaverse_tx_count",
+        "metaverse_user_count",
+        "metaverse_asset_count",
+        "metaverse_item_count",
+        "metaverse_avatar_count",
+        "metaverse_scene_count",
+        "metaverse_count",
+        "metaverse_hotspot_ratio",
+        "metaverse_cross_scene_ratio",
+        "metaverse_cross_shard_ratio",
+        "metaverse_cross_scene_count",
+        "metaverse_cross_shard_count",
+        "metaverse_burst_count",
+        "metaverse_offchain_confirmation_count",
+        "metaverse_offchain_failure_count",
+        "metaverse_cross_metaverse_count",
+        "baseline_matrix_enabled",
+        "baseline_count",
+        "multi_seed_enabled",
+        "seed_count",
+        "paper_export_enabled",
+        "paper_table_available",
+        "paper_figure_data_available",
+        "metaverse_experiment_truth",
+        "experiment_template",
+        "preset_id",
+        "preset_name",
+        "ablation_stage",
+        "enabled_metatrack_components",
+        "controlled_modules",
+        "variable_module",
+        "locked_modules",
+        "fairness_validated",
+        "primary_metrics",
+        "expected_artifacts",
+        "result_guide",
+        "truthfulness_note",
+    )
+    return {key: summary[key] for key in keys if key in summary}
+
+
+def _selected_plugins(normalized: dict[str, Any], composer: dict[str, Any]) -> dict[str, str]:
+    selection = normalized.get("plugin_selection")
+    if isinstance(selection, dict):
+        return {str(key): str(value) for key, value in selection.items()}
+    modules = composer.get("modules", {})
+    if isinstance(modules, dict):
+        return {
+            str(module_id): str(module.get("plugin", ""))
+            for module_id, module in modules.items()
+            if isinstance(module, dict) and module.get("plugin")
+        }
+    return {}
+
+
+def _missing_files(run_dir: Path) -> list[str]:
+    missing = [filename for filename in REQUIRED_HISTORY_FILES if not (run_dir / filename).is_file()]
+    if not (run_dir / "summary.csv").is_file() and not (run_dir / "summary.json").is_file():
+        missing.append("summary.csv or summary.json")
+    if not (run_dir / "runtime.log").is_file():
+        missing.append("runtime.log")
+    return missing
+
+
+def _mtime(path: Path) -> str:
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()

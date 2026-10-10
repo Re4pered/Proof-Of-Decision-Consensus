@@ -1,0 +1,24 @@
+# Porygon v8 source-code mapping
+
+- `executor/v5/porygon_plugins.go`
+  - single physical ordering-domain routing
+  - Transaction Block witness evidence
+  - sender→ESC and state-key→logical-shard mapping
+  - conflict/lock wave planning
+  - W/O/E/C and Cross-Batch Witness protocol-slot evidence
+  - physical Relay disablement
+- `executor/v5/porygon_executor.go`
+  - signed-AccessList state projection
+  - fixed worker-pool ESC wave execution
+  - access-closure verification
+  - exactly-once business execution evidence
+  - atomic deterministic multi-key materialization
+  - Porygon truth-boundary metrics
+- `executor/v5/porygon_plugins_test.go`
+  - control-plane isolation, ESC distribution, cross-ESC parallelism, global conflict order, oracle, access fail-closed and tamper tests
+- `backend/app/services/v5_compatibility_engine.py`
+  - one-physical-shard guard and configuration matching
+- `backend/app/services/v5_formal_plan_validator.py`
+  - builtin Porygon method profile
+- `backend/app/services/v5_metric_extractor.py`
+  - mechanism-evidence extraction

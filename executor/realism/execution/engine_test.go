@@ -1,0 +1,652 @@
+package execution
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"metaverse-chainlab/executor/realism/block"
+	"metaverse-chainlab/executor/realism/execution/blockstm"
+	"metaverse-chainlab/executor/realism/state"
+	"metaverse-chainlab/executor/realism/tx"
+)
+
+func TestEngineDeterministicExecution(t *testing.T) {
+	txs, _, _, err := tx.Generate(tx.GenerateOptions{Count: 2, Sender: "alice", Receiver: "bob", Value: 1, Seed: "exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := block.Block{ShardID: "s0", Height: 1, PreviousHash: "genesis", ProposerID: "n0", Timestamp: 1, TxList: txs}
+	for _, item := range txs {
+		b.TxIDs = append(b.TxIDs, item.TxID)
+	}
+	block.AssignHash(&b)
+	db1 := state.NewDB(t.TempDir(), "s0")
+	db2 := state.NewDB(t.TempDir(), "s0")
+	r1 := NewEngine().ExecuteBlock(b, db1)
+	r2 := NewEngine().ExecuteBlock(b, db2)
+	if r1.StateRootAfter != r2.StateRootAfter || r1.ReceiptRoot != r2.ReceiptRoot {
+		t.Fatalf("execution not deterministic")
+	}
+	if r1.SuccessfulTxs != 2 || r1.FailedTxs != 0 {
+		t.Fatalf("unexpected receipt counts: %+v", r1)
+	}
+}
+
+func TestSerialBlockExecutorMatchesLegacyEngine(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []tx.SignedTransaction
+	}{
+		{name: "single_valid_transfer", items: mustGenerateForExecutionTest(t, "single", 1, "alice", "bob", 1, "v5_safe")},
+		{name: "multiple_continuous_nonces", items: mustGenerateForExecutionTest(t, "nonces", 4, "alice", "bob", 1, "v5_safe")},
+		{name: "nonce_mismatch", items: withNonce(mustGenerateForExecutionTest(t, "nonce-mismatch", 1, "alice", "bob", 1, "v5_safe"), 2)},
+		{name: "invalid_value", items: withValue(mustGenerateForExecutionTest(t, "invalid", 1, "alice", "bob", 1, "v5_safe"), 0)},
+		{name: "insufficient_balance", items: mustGenerateForExecutionTest(t, "insufficient", 1, "alice", "bob", 2_000_000, "v5_safe")},
+		{name: "shared_sender", items: append(mustGenerateForExecutionTest(t, "shared-sender-a", 2, "alice", "bob", 1, "v5_safe"), mustGenerateForExecutionTest(t, "shared-sender-b", 2, "alice", "carol", 1, "v5_safe")...)},
+		{name: "shared_receiver", items: append(mustGenerateForExecutionTest(t, "shared-receiver-a", 1, "alice", "carol", 1, "v5_safe"), mustGenerateForExecutionTest(t, "shared-receiver-b", 1, "bob", "carol", 1, "v5_safe")...)},
+		{name: "sender_equals_receiver", items: mustGenerateForExecutionTest(t, "self", 1, "alice", "alice", 1, "v5_safe")},
+		{name: "new_account_initialization", items: mustGenerateForExecutionTest(t, "new-account", 1, "new-sender", "new-receiver", 1, "v5_safe")},
+		{name: "cross_shard_source_transaction", items: mustGenerateForExecutionTest(t, "cross", 2, "alice", "bob", 1, "v5_cross:s0->s1")},
+		{name: "cross_shard_target_commit", items: mustGenerateForExecutionTest(t, "target-commit", 1, "relay-sender", "relay-receiver", 1, "v5_cross:s0")},
+		{name: "relay_transaction", items: withSourceKind(mustGenerateForExecutionTest(t, "relay", 1, "relay-sender", "relay-receiver", 1, "v5_relay"), "relay_certificate")},
+		{name: "synthetic_workload", items: mustGenerateForExecutionTest(t, "synthetic", 3, "synthetic-sender", "synthetic-receiver", 1, "v5_safe")},
+		{name: "canonical_trace_replay", items: withSourceKind(mustGenerateForExecutionTest(t, "dataset", 3, "dataset-sender", "dataset-receiver", 1, "dataset_event:asset_sale"), "canonical_trace_replay")},
+		{name: "hot_key_sequence", items: mustGenerateForExecutionTest(t, "hot", 16, "hot-sender", "hot-receiver", 1, "v5_commutative")},
+		{name: "empty_block", items: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertSerialEquivalent(t, blockForExecutionTest(tc.items))
+		})
+	}
+}
+
+func TestSerialBlockExecutorDuplicateBlockMatchesLegacy(t *testing.T) {
+	b := blockForExecutionTest(mustGenerateForExecutionTest(t, "duplicate", 1, "alice", "bob", 1, "v5_safe"))
+	legacyDB := state.NewDB(t.TempDir(), "s0")
+	serialDB := state.NewDB(t.TempDir(), "s0")
+	legacy := NewEngine()
+	serial := NewSerialExecutor()
+	_ = legacy.ExecuteBlock(b, legacyDB)
+	first := serial.ExecuteBlock(b, serialDB.Snapshot())
+	if err := serialDB.ApplyDeterministicBatch(toStateKV(first.StateDelta)); err != nil {
+		t.Fatal(err)
+	}
+	legacySecond := legacy.ExecuteBlock(b, legacyDB)
+	serialSecond := serial.ExecuteBlock(b, serialDB.Snapshot())
+	if err := serialDB.ApplyDeterministicBatch(toStateKV(serialSecond.StateDelta)); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(legacySecond.Receipts, serialSecond.Receipts) || !reflect.DeepEqual(legacyDB.Snapshot(), serialDB.Snapshot()) {
+		t.Fatalf("duplicate execution diverged legacy=%+v serial=%+v", legacySecond, serialSecond)
+	}
+}
+
+func TestCrossShardTargetCommitDoesNotConsumeSourceNonce(t *testing.T) {
+	item := mustGenerateForExecutionTest(t, "target-commit-no-nonce", 1, "relay-sender", "relay-receiver", 1, "v5_cross:s0")[0]
+	b := blockForExecutionTest([]tx.SignedTransaction{item})
+	serial := NewSerialExecutor().ExecuteBlock(b, nil)
+	if serial.SuccessfulTxs != 1 || len(serial.Receipts) != 1 || !serial.Receipts[0].Success {
+		t.Fatalf("target commit should be durable-successful: %#v", serial)
+	}
+	if _, ok := serial.StateUpdates["s0::relay_commit:"+item.TxID]; !ok {
+		t.Fatalf("target commit did not record durable marker: %#v", serial.StateUpdates)
+	}
+	if _, ok := serial.StateUpdates["s0::nonce:"+item.Sender]; ok {
+		t.Fatalf("target commit must not consume source sender nonce: %#v", serial.StateUpdates)
+	}
+
+	sourceItem := item
+	sourceItem.Payload = "v5_cross:s1"
+	sourceBlock := blockForExecutionTest([]tx.SignedTransaction{sourceItem})
+	source := NewSerialExecutor().ExecuteBlock(sourceBlock, nil)
+	if source.StateUpdates["s0::nonce:"+sourceItem.Sender] != "1" {
+		t.Fatalf("source-side cross-shard transaction should still consume nonce: %#v", source.StateUpdates)
+	}
+}
+
+func TestBlockSTMExecutorMatchesSerialAcrossWorkerCounts(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []tx.SignedTransaction
+	}{
+		{name: "independent", items: append(mustGenerateForExecutionTest(t, "bstm-independent-a", 1, "alice", "bob", 1, "v5_safe"), mustGenerateForExecutionTest(t, "bstm-independent-b", 1, "carol", "dave", 1, "v5_safe")...)},
+		{name: "same_sender_continuous_nonces", items: mustGenerateForExecutionTest(t, "bstm-nonce", 4, "alice", "bob", 1, "v5_safe")},
+		{name: "nonce_conflict", items: withNonce(mustGenerateForExecutionTest(t, "bstm-nonce-conflict", 2, "alice", "bob", 1, "v5_safe"), 3)},
+		{name: "balance_conflict", items: mustGenerateForExecutionTest(t, "bstm-balance", 2, "alice", "bob", 800_000, "v5_safe")},
+		{name: "invalid_value", items: withValue(mustGenerateForExecutionTest(t, "bstm-invalid", 1, "alice", "bob", 1, "v5_safe"), 0)},
+		{name: "receiver_hotspot", items: append(mustGenerateForExecutionTest(t, "bstm-receiver-a", 1, "alice", "hot", 1, "v5_safe"), mustGenerateForExecutionTest(t, "bstm-receiver-b", 1, "bob", "hot", 1, "v5_safe")...)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := blockForExecutionTest(tc.items)
+			serial := NewSerialExecutor().ExecuteBlock(b, map[string]string{})
+			for _, workers := range []int{1, 2, 4, 8} {
+				executor := NewBlockSTMExecutor(workers)
+				got, err := executor.ExecuteBlock(testContext(t), b, map[string]string{})
+				if err != nil {
+					t.Fatalf("worker %d failed: %v", workers, err)
+				}
+				if !reflect.DeepEqual(serial.Receipts, got.Receipts) || serial.ReceiptRoot != got.ReceiptRoot || serial.StateRootAfter != got.StateRootAfter || !reflect.DeepEqual(serial.StateDelta, got.StateDelta) {
+					t.Fatalf("worker %d diverged\nserial=%+v\ngot=%+v", workers, serial, got)
+				}
+				if got.BlockExecutorID != BlockSTMExecutorID || got.WorkerCount != workers || got.Plan.WorkerCount != workers || got.PlanDigest == "" {
+					t.Fatalf("worker %d missing block-stm identity/plan: %+v", workers, got)
+				}
+			}
+		})
+	}
+}
+
+func TestBlockSTMExecutorHotNonceSequencePreservesMetricsAndSerialEquivalence(t *testing.T) {
+	b := blockForExecutionTest(mustGenerateForExecutionTest(t, "bstm-hot-nonce", 4, "alice", "bob", 1, "v5_safe"))
+	executor := NewBlockSTMExecutor(4)
+	got, err := executor.ExecuteBlock(testContext(t), b, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial := NewSerialExecutor().ExecuteBlock(b, map[string]string{})
+	if got.StateRootAfter != serial.StateRootAfter || got.ReceiptRoot != serial.ReceiptRoot {
+		t.Fatalf("block-stm not serial equivalent")
+	}
+	if got.BlockSTMMetrics.AbortCount != executor.Metrics.AbortCount || got.BlockSTMMetrics.ReexecutionCount != executor.Metrics.ReexecutionCount {
+		t.Fatalf("block-stm result did not carry kernel metrics: result=%+v executor=%+v", got.BlockSTMMetrics, executor.Metrics)
+	}
+	if executor.Metrics.AbortCount != executor.Metrics.DependencyAbortCount+executor.Metrics.ValidationAbortCount {
+		t.Fatalf("abort decomposition is inconsistent: %+v", executor.Metrics)
+	}
+	if executor.Metrics.ValidationTaskCount < len(b.TxList) || executor.Metrics.ExecutionTaskCount < len(b.TxList) {
+		t.Fatalf("expected execution and validation tasks for every transaction, got %+v", executor.Metrics)
+	}
+	if executor.Metrics.ValidatedSpeculativeResultCount < len(b.TxList) {
+		t.Fatalf("expected validated final incarnations for every transaction, got %+v", executor.Metrics)
+	}
+	if executor.Metrics.AbortCount == 0 {
+		if executor.Metrics.ReexecutionCount != 0 || executor.Metrics.MaximumIncarnation != 0 {
+			t.Fatalf("no-abort execution reported reexecution/incarnation activity: %+v", executor.Metrics)
+		}
+	} else if executor.Metrics.ReexecutionCount == 0 || executor.Metrics.MaximumIncarnation < 1 {
+		t.Fatalf("abort execution did not report reexecution/incarnation activity: %+v", executor.Metrics)
+	}
+	if executor.Metrics.ValidationAbortCount > 0 && executor.Metrics.ValidationFailureCount == 0 {
+		t.Fatalf("validation abort did not record a validation failure: %+v", executor.Metrics)
+	}
+	if executor.Metrics.EstimateCount != executor.Metrics.EstimateMarkCount {
+		t.Fatalf("ESTIMATE counters are inconsistent: %+v", executor.Metrics)
+	}
+	if executor.Metrics.MaximumParallelWidth < 1 || executor.Metrics.MaximumParallelWidth > executor.Metrics.WorkerCount {
+		t.Fatalf("unexpected maximum parallel width: %+v", executor.Metrics)
+	}
+}
+
+func TestBlockSTMExecutorDenseNonceSequenceRemainsEquivalentAcrossSchedulerInterleavings(t *testing.T) {
+	b := blockForExecutionTest(mustGenerateForExecutionTest(t, "bstm-hot-nonce-second-incarnation", 8, "alice", "bob", 1, "v5_safe"))
+	executor := NewBlockSTMExecutor(8)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got, err := executor.ExecuteBlock(ctx, b, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial := NewSerialExecutor().ExecuteBlock(b, map[string]string{})
+	if got.StateRootAfter != serial.StateRootAfter || got.ReceiptRoot != serial.ReceiptRoot {
+		t.Fatalf("block-stm not serial equivalent")
+	}
+	if executor.Metrics.AbortCount != executor.Metrics.DependencyAbortCount+executor.Metrics.ValidationAbortCount {
+		t.Fatalf("abort decomposition is inconsistent: %+v", executor.Metrics)
+	}
+	if executor.Metrics.AbortCount > 0 && (executor.Metrics.MaximumIncarnation < 1 || executor.Metrics.ReexecutionCount == 0) {
+		t.Fatalf("abort execution did not reexecute a later incarnation: %+v", executor.Metrics)
+	}
+	if executor.Metrics.ValidationAbortCount > 0 && executor.Metrics.ValidationFailureCount == 0 {
+		t.Fatalf("validation abort did not record a validation failure: %+v", executor.Metrics)
+	}
+	if executor.Metrics.EstimateCount != executor.Metrics.EstimateMarkCount {
+		t.Fatalf("ESTIMATE counters are inconsistent: %+v", executor.Metrics)
+	}
+}
+
+func TestBlockSTMExecutorDenseNonceConflictRemainsLive(t *testing.T) {
+	b := blockForExecutionTest(mustGenerateForExecutionTest(t, "bstm-dense-liveness", 8, "alice", "bob", 1, "v5_safe"))
+	serial := NewSerialExecutor().ExecuteBlock(b, map[string]string{})
+
+	for iteration := 0; iteration < 25; iteration++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		executor := NewBlockSTMExecutor(8)
+		got, err := executor.ExecuteBlock(ctx, b, map[string]string{})
+		cancel()
+
+		if err != nil {
+			t.Fatalf("dense conflict iteration %d did not complete: %v", iteration, err)
+		}
+		if got.StateRootAfter != serial.StateRootAfter || got.ReceiptRoot != serial.ReceiptRoot {
+			t.Fatalf("dense conflict iteration %d diverged from serial execution", iteration)
+		}
+	}
+}
+
+func TestBlockSTMExecutorCompletesHotDatasetSaleShape(t *testing.T) {
+	sender := "0x0f1be46ce4e76e018fe537cdc85f795ded5d5e34"
+	receivers := []string{
+		"receiver_0xcfbb134e83aab817453359a9210079306fe51347",
+		"receiver_0x1e010790e03ab7f23ff6195c1623013dc3b386cc",
+		"receiver_0x37fb0006b93a43ea51c8e5a0210fc5c7cc99b202",
+		"receiver_0xcfbb134e83aab817453359a9210079306fe51347",
+		"receiver_0xcfbb134e83aab817453359a9210079306fe51347",
+		"receiver_0x3196fca892fa79fbb052b451a4d86b3c4aeb990c",
+		"receiver_0xb3ae1f5e603abd59de79a0fb0707fdbea3a90957",
+		"receiver_0xcfbb134e83aab817453359a9210079306fe51347",
+		"receiver_0xb3ae1f5e603abd59de79a0fb0707fdbea3a90957",
+		"receiver_0xb3ae1f5e603abd59de79a0fb0707fdbea3a90957",
+	}
+	markets := []string{
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xbada8a315e84e4d78e3b6914003647226d9b4001",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+		"market:0xa25c20f58ac447621a5f854067b857709cbd60eb",
+	}
+	items := make([]tx.SignedTransaction, 0, len(receivers))
+	for index, receiver := range receivers {
+		items = append(items, tx.SignedTransaction{
+			TxID:      "dataset-hot-" + strconv.Itoa(index),
+			Sender:    sender,
+			Receiver:  receiver,
+			Nonce:     uint64(index),
+			Value:     1,
+			Payload:   "dataset_event:emote",
+			StateKeys: []string{"shard:s0:account", markets[index], "category:emote"},
+			AccessList: []tx.AccessItem{
+				{Key: "balance:" + sender, Mode: tx.AccessReadWrite, UpdateSemantics: "buyer_balance"},
+				{Key: "balance:" + receiver, Mode: tx.AccessReadWrite, UpdateSemantics: "seller_balance"},
+				{Key: "category:emote", Mode: tx.AccessRead, UpdateSemantics: "category_metadata"},
+				{Key: markets[index], Mode: tx.AccessCommutativeDelta, UpdateSemantics: "market_sale_counter", Delta: 1},
+				{Key: "nonce:" + sender, Mode: tx.AccessReadWrite, UpdateSemantics: "buyer_nonce"},
+				{Key: "nonce:" + receiver, Mode: tx.AccessRead, UpdateSemantics: "seller_nonce_state"},
+			},
+		})
+	}
+	b := blockForExecutionTest(items)
+	base := map[string]string{"s0::balance:" + sender: "1000000", "s0::nonce:" + sender: "0"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got, err := NewBlockSTMExecutor(8).ExecuteBlock(ctx, b, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial := NewSerialExecutor().ExecuteBlock(b, base)
+	if !sameExecutionOutput(serial, got) {
+		t.Fatalf("hot dataset sale shape diverged from serial")
+	}
+}
+
+func TestBlockSTMSpeculativeExecutionOrderIsDeterministic(t *testing.T) {
+	if got := speculativeExecutionOrder(4, 1); !reflect.DeepEqual(got, []int{0, 1, 2, 3}) {
+		t.Fatalf("single worker should execute in serial order, got %#v", got)
+	}
+	if got := speculativeExecutionOrder(4, 4); !reflect.DeepEqual(got, []int{0, 1, 2, 3}) {
+		t.Fatalf("multi-worker scheduling must preserve lower-index priority, got %#v", got)
+	}
+}
+
+func TestBlockSTMCapturedReadsRecordObservedMVVersion(t *testing.T) {
+	memory := blockstm.NewMVMemory()
+	memory.Write("balance:alice", blockstm.Version{Txn: 0, Incarnation: 0}, "999999")
+	logicalBase := map[string]string{"balance:alice": "1000000"}
+	base := map[string]string{"s0::balance:alice": "1000000"}
+	overlay := newTxOverlay("s0", speculativeSnapshot(memory, base, logicalBase, "s0", 1))
+
+	if got := overlay.balance("alice"); got != 999999 {
+		t.Fatalf("speculative snapshot did not expose lower MV version, got %d", got)
+	}
+	captured := capturedFromOverlayWithMemory(overlay, memory, logicalBase, 1)
+
+	if len(captured.Reads) != 1 {
+		t.Fatalf("expected one captured read, got %#v", captured.Reads)
+	}
+	read := captured.Reads[0]
+	if read.FromBase || read.Version != (blockstm.Version{Txn: 0, Incarnation: 0}) || read.Value != "999999" {
+		t.Fatalf("captured read did not preserve observed MV version: %#v", read)
+	}
+}
+
+func TestBlockSTMExecutorHonorsCanceledContext(t *testing.T) {
+	b := blockForExecutionTest(mustGenerateForExecutionTest(t, "bstm-cancel", 8, "alice", "bob", 1, "v5_safe"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := NewBlockSTMExecutor(4).ExecuteBlock(ctx, b, map[string]string{}); err == nil {
+		t.Fatal("expected canceled context to stop block-stm execution")
+	}
+}
+
+func TestBlockSTMPerformanceModeSkipsFullSerialOracle(t *testing.T) {
+	items := append(
+		mustGenerateForExecutionTest(t, "perf-a", 1, "alice", "bob", 5, "v5_safe"),
+		mustGenerateForExecutionTest(t, "perf-b", 1, "carol", "dave", 7, "v5_safe")...,
+	)
+	b := blockForExecutionTest(items)
+	base := map[string]string{}
+	correct := NewBlockSTMExecutor(4)
+	correct.ExecutionMode = "correctness"
+	correct.OracleMode = "full"
+	expected, err := correct.ExecuteBlock(testContext(t), b, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perf := NewBlockSTMExecutor(4)
+	perf.ExecutionMode = "performance"
+	perf.OracleMode = "off"
+	actual, err := perf.ExecuteBlock(testContext(t), b, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual.BlockSTMMetrics.SerialOracleMS != 0 {
+		t.Fatalf("performance mode must not run full serial oracle: %+v", actual.BlockSTMMetrics)
+	}
+	expectedBusinessCalls := actual.BlockSTMMetrics.ExecutionTaskCount
+	if actual.BlockSTMMetrics.BusinessExecutionCount != expectedBusinessCalls {
+		t.Fatalf("performance mode must not add hidden materialization business execution: got %d want %d metrics=%+v", actual.BlockSTMMetrics.BusinessExecutionCount, expectedBusinessCalls, actual.BlockSTMMetrics)
+	}
+	if !sameExecutionOutput(expected, actual) {
+		t.Fatalf("performance output diverged from correctness output")
+	}
+}
+
+func TestBlockSTMIncarnationLimitFailNeverReturnsPartialResults(t *testing.T) {
+	b := blockForExecutionTest(mustGenerateForExecutionTest(t, "bstm-limit-fail", 4, "alice", "bob", 1, "v5_safe"))
+	executor := NewBlockSTMExecutor(4)
+	executor.MaximumIncarnations = 0
+	executor.IncarnationLimitAction = "fail"
+	result, err := executor.ExecuteBlock(testContext(t), b, map[string]string{})
+	if err != nil {
+		t.Fatalf("maximum_incarnations=0 disables the limit and should not fail: %v", err)
+	}
+	if len(result.Receipts) != len(b.TxList) || len(result.TxDeltas) != len(b.TxList) {
+		t.Fatalf("all transactions must have results when limit is disabled: receipts=%d deltas=%d", len(result.Receipts), len(result.TxDeltas))
+	}
+
+	limited := NewBlockSTMExecutor(4)
+	limited.MaximumIncarnations = 1
+	limited.IncarnationLimitAction = "fail"
+	limitedResult, limitedErr := limited.ExecuteBlock(testContext(t), b, map[string]string{})
+	if limitedErr != nil {
+		if !strings.Contains(limitedErr.Error(), "maximum incarnations exceeded") {
+			t.Fatalf("unexpected incarnation-limit error: %v", limitedErr)
+		}
+		return
+	}
+	// A low-index-first scheduler is allowed to avoid an abort entirely for
+	// this short chain.  In that interleaving the limit is never reached and
+	// the executor must return a complete, serial-equivalent block.
+	serial := NewSerialExecutor().ExecuteBlock(b, map[string]string{})
+	if len(limitedResult.Receipts) != len(b.TxList) || len(limitedResult.TxDeltas) != len(b.TxList) || !sameExecutionOutput(serial, limitedResult) {
+		t.Fatalf("non-triggered incarnation limit returned an incomplete/divergent result: %+v", limitedResult)
+	}
+}
+
+func TestBlockSTMIncarnationLimitSerialFallbackReturnsCompleteEquivalentBlock(t *testing.T) {
+	b := blockForExecutionTest(mustGenerateForExecutionTest(t, "bstm-limit-fallback", 4, "alice", "bob", 1, "v5_safe"))
+	serial := NewSerialExecutor().ExecuteBlock(b, map[string]string{})
+	executor := NewBlockSTMExecutor(4)
+	executor.MaximumIncarnations = 1
+	executor.IncarnationLimitAction = "serial_fallback"
+	result, err := executor.ExecuteBlock(testContext(t), b, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BlockSTMMetrics.SerialFallbackCount > 0 && result.BlockSTMMetrics.IncarnationLimitHitCount == 0 {
+		t.Fatalf("fallback occurred without an incarnation-limit hit: %+v", result.BlockSTMMetrics)
+	}
+	if result.BlockSTMMetrics.SerialFallbackCount == 0 && result.BlockSTMMetrics.IncarnationLimitHitCount != 0 {
+		t.Fatalf("incarnation-limit hit was recorded without fallback: %+v", result.BlockSTMMetrics)
+	}
+	if len(result.Receipts) != len(b.TxList) || len(result.TxDeltas) != len(b.TxList) {
+		t.Fatalf("execution must return complete results: receipts=%d deltas=%d", len(result.Receipts), len(result.TxDeltas))
+	}
+	if result.StateRootAfter != serial.StateRootAfter || result.ReceiptRoot != serial.ReceiptRoot {
+		t.Fatalf("execution diverged from serial: state %s/%s receipt %s/%s", result.StateRootAfter, serial.StateRootAfter, result.ReceiptRoot, serial.ReceiptRoot)
+	}
+	for index := range b.TxList {
+		if result.Receipts[index].TxID == "" || result.TxDeltas[index].TxID == "" {
+			t.Fatalf("transaction %d lacks final result: receipts=%+v deltas=%+v", index, result.Receipts, result.TxDeltas)
+		}
+	}
+}
+
+func TestCommutativeDeltaAccessProducesRealStateUpdateAndBlockSTMEquivalence(t *testing.T) {
+	sender := "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	receiver := "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	accessList := append(tx.DefaultTransferAccessList(sender, receiver), tx.AccessItem{Key: "coaccess:hot-update", Mode: tx.AccessCommutativeDelta, UpdateSemantics: "add", Delta: 3})
+	items, _, _, err := tx.Generate(tx.GenerateOptions{Count: 2, Sender: sender, Receiver: receiver, Value: 1, StateKeys: []string{"account:" + sender, "account:" + receiver, "coaccess:hot-update"}, AccessList: accessList, Seed: "commutative-delta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := blockForExecutionTest(items)
+	serial := NewSerialExecutor().ExecuteBlock(b, nil)
+	blockstmResult, err := NewBlockSTMExecutor(4).ExecuteBlock(testContext(t), b, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := serial.StateUpdates["s0::coaccess:hot-update"]; got != "6" {
+		t.Fatalf("commutative delta did not produce real state update: %q", got)
+	}
+	assertExecutionEquivalent(t, serial, blockstmResult)
+}
+
+func TestPureCommutativeDeltaTransactionSkipsTransferWrites(t *testing.T) {
+	sender := "0xcccccccccccccccccccccccccccccccccccccccc"
+	receiver := "0xdddddddddddddddddddddddddddddddddddddddd"
+	accessList := []tx.AccessItem{{Key: "coaccess:hot-update", Mode: tx.AccessCommutativeDelta, UpdateSemantics: "add", Delta: 2}}
+	items, _, _, err := tx.Generate(tx.GenerateOptions{Count: 3, Sender: sender, Receiver: receiver, Value: 1, StateKeys: []string{"coaccess:hot-update"}, AccessList: accessList, Seed: "pure-commutative-delta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := blockForExecutionTest(items)
+	legacyDB := state.NewDB(t.TempDir(), "s0")
+	legacy := NewEngine().ExecuteBlock(b, legacyDB)
+	serial := NewSerialExecutor().ExecuteBlock(b, nil)
+	blockstmResult, err := NewBlockSTMExecutor(4).ExecuteBlock(testContext(t), b, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := legacyDB.Snapshot()["s0::coaccess:hot-update"]; got != "6" {
+		t.Fatalf("legacy pure commutative delta did not update hot key: %q", got)
+	}
+	for _, key := range []string{"s0::balance:" + sender, "s0::nonce:" + sender, "s0::balance:" + receiver} {
+		if value := legacyDB.Snapshot()[key]; value != "" {
+			t.Fatalf("pure commutative delta should not write transfer key %s=%q", key, value)
+		}
+	}
+	if !reflect.DeepEqual(legacy.Receipts, serial.Receipts) || legacy.StateRootAfter != serial.StateRootAfter || legacy.ReceiptRoot != serial.ReceiptRoot {
+		t.Fatalf("legacy and serial pure commutative semantics diverged\nlegacy=%+v\nserial=%+v", legacy, serial)
+	}
+	assertExecutionEquivalent(t, serial, blockstmResult)
+}
+
+func assertSerialEquivalent(t *testing.T, b block.Block) {
+	t.Helper()
+	legacyDB := state.NewDB(t.TempDir(), "s0")
+	serialDB := state.NewDB(t.TempDir(), "s0")
+	legacyResult := NewEngine().ExecuteBlock(b, legacyDB)
+	serialResult := NewSerialExecutor().ExecuteBlock(b, serialDB.Snapshot())
+	if err := serialDB.ApplyDeterministicBatch(toStateKV(serialResult.StateDelta)); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(legacyResult.Receipts, serialResult.Receipts) {
+		t.Fatalf("receipts diverged\nlegacy=%+v\nserial=%+v", legacyResult.Receipts, serialResult.Receipts)
+	}
+	if legacyResult.StateRootBefore != serialResult.StateRootBefore || legacyResult.StateRootAfter != serialResult.StateRootAfter || legacyResult.ReceiptRoot != serialResult.ReceiptRoot {
+		t.Fatalf("roots diverged legacy=%+v serial=%+v", legacyResult, serialResult)
+	}
+	if legacyResult.SuccessfulTxs != serialResult.SuccessfulTxs || legacyResult.FailedTxs != serialResult.FailedTxs {
+		t.Fatalf("counts diverged legacy=%+v serial=%+v", legacyResult, serialResult)
+	}
+	if !reflect.DeepEqual(legacyDB.Snapshot(), serialDB.Snapshot()) {
+		t.Fatalf("final state diverged\nlegacy=%v\nserial=%v", legacyDB.Snapshot(), serialDB.Snapshot())
+	}
+	if serialResult.Plan.EngineID != SerialBlockExecutorID || serialResult.Plan.WorkerCount != 1 || serialResult.PlanDigest == "" {
+		t.Fatalf("missing serial execution plan: %+v", serialResult.Plan)
+	}
+}
+
+func assertExecutionEquivalent(t *testing.T, expected, actual Result) {
+	t.Helper()
+	if !reflect.DeepEqual(expected.Receipts, actual.Receipts) {
+		t.Fatalf("receipts diverged\nexpected=%+v\nactual=%+v", expected.Receipts, actual.Receipts)
+	}
+	if expected.StateRootBefore != actual.StateRootBefore || expected.StateRootAfter != actual.StateRootAfter || expected.ReceiptRoot != actual.ReceiptRoot {
+		t.Fatalf("roots diverged expected=%+v actual=%+v", expected, actual)
+	}
+	if !reflect.DeepEqual(expected.StateDelta, actual.StateDelta) {
+		t.Fatalf("state delta diverged\nexpected=%+v\nactual=%+v", expected.StateDelta, actual.StateDelta)
+	}
+}
+
+func testContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func blockForExecutionTest(items []tx.SignedTransaction) block.Block {
+	b := block.Block{ShardID: "s0", Height: 1, PreviousHash: "genesis", ProposerID: "n0", Timestamp: 1, TxList: items}
+	for _, item := range items {
+		b.TxIDs = append(b.TxIDs, item.TxID)
+	}
+	block.AssignHash(&b)
+	return b
+}
+
+func mustGenerateForExecutionTest(t *testing.T, seed string, count int, sender, receiver string, value int64, payload string) []tx.SignedTransaction {
+	t.Helper()
+	items, _, _, err := tx.Generate(tx.GenerateOptions{Count: count, Sender: sender, Receiver: receiver, Value: value, StateKeys: []string{"account:" + sender, "account:" + receiver}, Seed: seed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range items {
+		items[index].Payload = payload
+	}
+	return items
+}
+
+func withNonce(items []tx.SignedTransaction, nonce uint64) []tx.SignedTransaction {
+	items[0].Nonce = nonce
+	return items
+}
+
+func withValue(items []tx.SignedTransaction, value int64) []tx.SignedTransaction {
+	items[0].Value = value
+	return items
+}
+
+func withSourceKind(items []tx.SignedTransaction, sourceKind string) []tx.SignedTransaction {
+	for index := range items {
+		items[index].SourceKind = sourceKind
+	}
+	return items
+}
+
+func toStateKV(items []StateUpdate) []state.StateKV {
+	out := make([]state.StateKV, 0, len(items))
+	for _, item := range items {
+		out = append(out, state.StateKV{Key: item.Key, Value: item.Value})
+	}
+	return out
+}
+
+func TestBlockSTMExecutorCompletesTwoThousandTransactionBlockWithoutArtificialLimit(t *testing.T) {
+	const transactionCount = 2000
+	const senderCount = 128
+	const receiverCount = 64
+	items := make([]tx.SignedTransaction, 0, transactionCount)
+	for index := 0; index < transactionCount; index++ {
+		sender := fmt.Sprintf("scale-sender-%03d", index%senderCount)
+		receiver := fmt.Sprintf("scale-receiver-%03d", index%receiverCount)
+		nonce := uint64(index / senderCount)
+		items = append(items, tx.SignedTransaction{
+			TxID:      fmt.Sprintf("scale-tx-%04d", index),
+			Sender:    sender,
+			Receiver:  receiver,
+			Nonce:     nonce,
+			Value:     1,
+			Payload:   "dataset_event:asset_sale",
+			StateKeys: []string{"market:shared", "category:wearable"},
+			AccessList: []tx.AccessItem{
+				{Key: "balance:" + sender, Mode: tx.AccessReadWrite, UpdateSemantics: "buyer_balance"},
+				{Key: "balance:" + receiver, Mode: tx.AccessReadWrite, UpdateSemantics: "seller_balance"},
+				{Key: "nonce:" + sender, Mode: tx.AccessReadWrite, UpdateSemantics: "buyer_nonce"},
+				{Key: "market:shared", Mode: tx.AccessCommutativeDelta, UpdateSemantics: "market_sale_counter", Delta: 1},
+				{Key: "category:wearable", Mode: tx.AccessRead, UpdateSemantics: "category_metadata"},
+			},
+		})
+	}
+	b := blockForExecutionTest(items)
+	serial := NewSerialExecutor().ExecuteBlock(b, nil)
+	executor := NewBlockSTMExecutor(4)
+	executor.ExecutionMode = "performance"
+	executor.OracleMode = "off"
+	executor.MaximumIncarnations = 0
+	progressEvents := 0
+	lastProgress := BlockSTMProgress{}
+	executor.Progress = func(progress BlockSTMProgress) {
+		progressEvents++
+		lastProgress = progress
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := executor.ExecuteBlock(ctx, b, nil)
+	if err != nil {
+		t.Fatalf("2K block did not complete: %v", err)
+	}
+	if !sameExecutionOutput(serial, result) {
+		t.Fatal("2K block diverged from serial execution")
+	}
+	if result.BlockSTMMetrics.SerialFallbackCount != 0 || result.BlockSTMMetrics.IncarnationLimitHitCount != 0 {
+		t.Fatalf("2K block used an artificial fallback/limit: %+v", result.BlockSTMMetrics)
+	}
+	if result.BlockSTMMetrics.AbortCount == 0 || result.BlockSTMMetrics.ReexecutionCount == 0 {
+		t.Fatalf("2K hotspot block did not exercise abort/reexecution semantics: %+v", result.BlockSTMMetrics)
+	}
+	if progressEvents == 0 || lastProgress.ValidatedCount != transactionCount || lastProgress.TransactionCount != transactionCount {
+		t.Fatalf("2K block progress evidence is incomplete: events=%d last=%+v", progressEvents, lastProgress)
+	}
+}
+
+func TestBlockSTMRevokesHigherValidationWhenLowerPublishesFirstVersion(t *testing.T) {
+	items := mustGenerateForExecutionTest(t, "bstm-validation-frontier", 4, "alice", "bob", 1, "v5_safe")
+	// Make transaction zero finish after the higher transactions.  This forces
+	// higher executions to observe the base nonce and makes their first
+	// validation eligible to complete before transaction zero publishes the
+	// first lower MVMemory version for the nonce/balance locations.
+	for index := 0; index < 20000; index++ {
+		items[0].AccessList = append(items[0].AccessList, tx.AccessItem{
+			Key:             fmt.Sprintf("category:frontier-%05d", index),
+			Mode:            tx.AccessRead,
+			UpdateSemantics: "category_metadata",
+		})
+	}
+	b := blockForExecutionTest(items)
+	serial := NewSerialExecutor().ExecuteBlock(b, map[string]string{})
+	executor := NewBlockSTMExecutor(4)
+	got, err := executor.ExecuteBlock(testContext(t), b, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameExecutionOutput(serial, got) {
+		t.Fatalf("validation-frontier invalidation diverged from serial: metrics=%+v", got.BlockSTMMetrics)
+	}
+	if got.BlockSTMMetrics.ValidationTaskCount <= len(items) {
+		t.Fatalf("test did not exercise higher validation invalidation: %+v", got.BlockSTMMetrics)
+	}
+}
