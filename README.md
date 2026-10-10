@@ -367,3 +367,5 @@ After a run completes, the frontend artifact panel shows available summary, log,
 - `v3_final_summary.json`
 
 These launcher, node process, local multi-process runtime, NetworkAdapter, PBFT-over-network, cross-shard skeleton, Relay MVP, state authenticity, committee/epoch, metaverse workload, benchmark hardening, fault injection, observability, and reproducibility files are preview / MVP artifacts only. They do not prove production networking, production PBFT, full Byzantine safety, production fault tolerance, production monitoring, multi-server deployment, production cluster behavior, BlockEmulator backend behavior, complete Relay/Broker/2PC/Monoxide, production atomic cross-shard commit, Byzantine-secure relay, Ethereum-compatible MPT, production database durability, full stateless execution, complete cross-shard state proof protocol, large-scale distributed benchmark, performance superiority, or paper-grade benchmark evidence.
+# Proof-Of-Decision-Consensus
+
